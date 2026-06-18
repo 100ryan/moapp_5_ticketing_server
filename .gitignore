@@ -1,0 +1,29 @@
+# 발표/보고서 산출물 (별도 관리)
+docs/
+
+# 부하 측정 결과
+profile_report/
+gmon.out
+gmon.*
+*.gprof
+
+# 컴파일 산출물 (Linux 바이너리)
+*.o
+*.a
+common/*.o
+
+# 좌석 데이터 (런타임 생성)
+data/seats.bin
+
+# 임시/캐시
+/tmp/
+*.tmp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace

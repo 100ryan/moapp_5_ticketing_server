@@ -9,16 +9,20 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <csignal>
+#include <cerrno>
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
 #include <string>
 #include <unordered_map>
 #include <iostream>
@@ -26,6 +30,12 @@
 using namespace ticketing;
 
 static int32_t* g_seats = nullptr;
+static std::atomic<int> g_seats_left{0};   // 남은 빈 좌석 수 (0 되면 매진)
+
+// gprof 는 정상 종료(return from main / exit) 시에만 gmon.out 을 작성한다.
+// 무한 epoll 루프를 SIGTERM/SIGINT 로 빠져나오기 위한 플래그.
+static volatile sig_atomic_t g_shutdown = 0;
+static void on_signal(int) { g_shutdown = 1; }
 
 static int open_and_map_seats() {
     int fd = ::open(TICKET_FILE, O_RDWR);
@@ -41,12 +51,28 @@ static int open_and_map_seats() {
         return -1;
     }
     g_seats = static_cast<int32_t*>(p);
+
+    // 초기 빈 좌석 수 계산
+    int left = 0;
+    for (int i = 0; i < MAX_SEATS; i++) if (g_seats[i] == 0) left++;
+    g_seats_left.store(left);
+    std::cout << "[메인 서버] 초기 빈 좌석 " << left << " / " << MAX_SEATS << "\n";
+    if (left == 0) {
+        // 시작부터 매진이면 클라이언트가 HELLO→TOKEN까지 다 받고 RESERVE에서야 FAIL_TAKEN.
+        // 큐 서버에는 단방향이라 알릴 채널이 없어서, 운영자가 알아챌 수 있도록 STDERR 경고.
+        std::cerr << "[메인 서버] 경고: 시작 시 모든 좌석이 이미 매진 — seats.bin 재초기화 필요\n";
+    }
+
     return fd;
 }
 
 static std::string handle_line(const std::string& line) {
     if (line.rfind("RESERVE:", 0) == 0) {
-        int seat = std::atoi(line.c_str() + 8);
+        // 좌석 인덱스는 반드시 비어있지 않은 숫자 — 빈 문자열이 atoi("")=0 으로 좌석 0 예약되는 버그 방지
+        const char* sp = line.c_str() + 8;
+        if (*sp == '\0') return "RESULT:BAD_REQUEST";
+        for (const char* q = sp; *q; q++) if (*q < '0' || *q > '9') return "RESULT:BAD_REQUEST";
+        int seat = std::atoi(sp);
         if (seat < 0 || seat >= MAX_SEATS) return "RESULT:BAD_REQUEST";
 
         int32_t expected = 0;
@@ -54,8 +80,10 @@ static std::string handle_line(const std::string& line) {
             &g_seats[seat], &expected, 1,
             false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
         if (ok) {
-            std::cout << "[OK] CAS 통과 (좌석 " << seat << ")" << std::endl;
-            return "RESULT:SUCCESS";
+            int left = g_seats_left.fetch_sub(1) - 1;
+            std::cout << "[OK] CAS 통과 (좌석 " << seat << ", 남은 " << left << ")" << std::endl;
+            // 응답 형식: RESULT:SUCCESS:<남은좌석수>
+            return "RESULT:SUCCESS:" + std::to_string(left);
         } else {
             return "RESULT:FAIL_TAKEN";
         }
@@ -73,6 +101,10 @@ static std::string handle_line(const std::string& line) {
 }
 
 int main() {
+    std::signal(SIGINT,  on_signal);
+    std::signal(SIGTERM, on_signal);
+    std::signal(SIGPIPE, SIG_IGN);  // send() 가 죽은 연결로 가도 프로세스 안 죽게
+
     int seats_fd = open_and_map_seats();
     if (seats_fd < 0) return 1;
 
@@ -106,13 +138,20 @@ int main() {
               << " 가동, " << MAX_SEATS << "석 mmap + CAS\n";
 
     epoll_event events[128];
-    while (true) {
+    while (!g_shutdown) {
         int n = ::epoll_wait(epfd, events, 128, -1);
+        if (n < 0) {
+            if (errno == EINTR) continue;  // 시그널로 깬 것 — 다음 while 검사에서 빠짐
+            std::perror("epoll_wait");
+            break;
+        }
         for (int i = 0; i < n; i++) {
             int fd = events[i].data.fd;
             if (fd == server_fd) {
                 int cfd = ::accept(server_fd, nullptr, nullptr);
                 if (cfd < 0) continue;
+                int flag = 1;
+                ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
                 epoll_event cev{};
                 cev.events = EPOLLIN;
                 cev.data.fd = cfd;
@@ -131,6 +170,13 @@ int main() {
             }
             std::string& acc = recv_buf[fd];
             acc.append(buf, buf + r);
+            if (acc.size() > MAX_LINE_BYTES) {
+                // '\n' 없이 폭주하는 연결 차단 — 메모리 무한 누적 방지
+                ::epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr);
+                ::close(fd);
+                recv_buf.erase(fd);
+                continue;
+            }
 
             size_t pos;
             while ((pos = acc.find('\n')) != std::string::npos) {
@@ -148,5 +194,12 @@ int main() {
             }
         }
     }
+
+    std::cerr << "[메인 서버] 종료 처리 중... (gmon.out 작성)\n";
+    for (auto& kv : recv_buf) ::close(kv.first);
+    ::close(server_fd);
+    ::close(epfd);
+    if (g_seats) ::munmap(g_seats, sizeof(int32_t) * MAX_SEATS);
+    ::close(seats_fd);
     return 0;
 }

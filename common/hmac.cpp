@@ -43,4 +43,13 @@ std::string hmac_sha256_hex(const std::string& key, const std::string& msg) {
     return Sha256::hex(outer, 32);
 }
 
+bool constant_time_eq(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+        diff |= (unsigned char)a[i] ^ (unsigned char)b[i];
+    }
+    return diff == 0;
+}
+
 }

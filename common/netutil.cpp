@@ -1,6 +1,7 @@
 #include "netutil.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <cerrno>
@@ -48,6 +49,9 @@ int connect_tcp(const char* host, int port) {
         ::close(fd);
         return -1;
     }
+    // 데몬 ↔ 백엔드 영속 연결: Nagle 비활성화로 작은 요청-응답 지연 제거
+    int flag = 1;
+    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
     return fd;
 }
 
